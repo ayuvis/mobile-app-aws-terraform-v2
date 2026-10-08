@@ -1,0 +1,131 @@
+# vLLM served as an Argo Rollout (canary) instead of a plain Deployment.
+# Before applying: replace <MODELS_BUCKET> with the `models_bucket` Terraform output
+# and pin the vLLM image by digest.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: inference
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vllm            # bound to the S3-read role via aws_eks_pod_identity_association
+  namespace: inference
+---
+# Clients (your BFF) call this Service. It selects BOTH stable and canary pods,
+# so canary traffic share follows the replica ratio.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-llama
+  namespace: inference
+spec:
+  selector: { app: vllm-llama }
+  ports:
+    - { name: http, port: 80, targetPort: http }
+---
+# Scrape vLLM's /metrics and copy the Rollouts pod-hash label onto every sample,
+# so the AnalysisTemplate can query the canary pods only.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: vllm
+  namespace: inference
+spec:
+  selector:
+    matchLabels: { app: vllm-llama }
+  podTargetLabels: ["rollouts-pod-template-hash"]
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: vllm-llama
+  namespace: inference
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: vllm-llama }
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: vllm-llama
+  namespace: inference
+spec:
+  replicas: 2                    # KEDA owns the live replica count (see 03-vllm-keda.yaml)
+  revisionHistoryLimit: 3
+  progressDeadlineSeconds: 1500  # new GPU node (~3-5 min) + weight download + model load
+  selector:
+    matchLabels: { app: vllm-llama }
+  strategy:
+    canary:
+      maxSurge: 1                # one extra GPU pod at a time
+      maxUnavailable: 0          # never drop below desired capacity during a rollout
+      # Background analysis: runs from step 1 until the rollout finishes.
+      # Any failed metric aborts the rollout and shifts traffic back to stable.
+      analysis:
+        templates:
+          - templateName: vllm-canary-health
+        startingStep: 1
+        args:
+          - name: canary-hash
+            valueFrom:
+              podTemplateHashValue: Latest
+      steps:
+        - setWeight: 25          # ~1 canary pod at 2-4 replicas
+        - pause: { duration: 10m }
+        - setWeight: 50
+        - pause: { duration: 10m }
+        - setWeight: 100
+  template:
+    metadata:
+      labels: { app: vllm-llama }
+    spec:
+      serviceAccountName: vllm
+      terminationGracePeriodSeconds: 120   # let in-flight generations finish
+      nodeSelector:
+        workload: llm-inference
+      tolerations:
+        - { key: nvidia.com/gpu, operator: Exists, effect: NoSchedule }
+      initContainers:
+        - name: fetch-weights   # pulls weights from S3, never from Hugging Face at start
+          image: amazon/aws-cli:2.17.0
+          command: ["aws", "s3", "sync", "s3://<MODELS_BUCKET>/llama-3.1-8b-instruct-awq/", "/models/llama"]
+          volumeMounts:
+            - { name: models, mountPath: /models }
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.6.3   # pin by digest in real use
+          args:
+            - --model=/models/llama
+            - --served-model-name=llama-3.1-8b
+            - --quantization=awq
+            - --max-model-len=8192
+            - --gpu-memory-utilization=0.90
+            - --enable-prefix-caching
+          ports:
+            - { name: http, containerPort: 8000 }
+          resources:
+            limits: { nvidia.com/gpu: 1 }
+          startupProbe:           # model load can take minutes
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+          lifecycle:
+            preStop:
+              exec: { command: ["sleep", "15"] }   # let the Service drop the pod before SIGTERM
+          volumeMounts:
+            - { name: models, mountPath: /models }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: models
+          emptyDir: {}
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 8Gi }

@@ -1,0 +1,62 @@
+# Canary health gates. Each metric is evaluated every minute against the
+# canary pods only (matched by the Rollouts pod-template-hash label).
+# If any metric exceeds its failureLimit, the Rollout aborts and traffic returns to stable.
+#
+# Metric names match vLLM v0.6.x. Newer vLLM releases renamed some of them
+# (for example the KV-cache gauge), so check /metrics on your pinned version.
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: vllm-canary-health
+  namespace: inference
+spec:
+  args:
+    - name: canary-hash
+  metrics:
+    # 1) Time-to-first-token p95 (SLO is 500 ms; gate at 800 ms to tolerate noise)
+    - name: ttft-p95
+      interval: 1m
+      failureLimit: 2
+      successCondition: len(result) == 0 || isNaN(result[0]) || result[0] < 0.8
+      provider:
+        prometheus:
+          address: http://kube-prometheus-stack-prometheus.monitoring.svc:9090
+          query: >-
+            histogram_quantile(0.95,
+              sum by (le) (
+                rate(vllm:time_to_first_token_seconds_bucket{namespace="inference",rollouts_pod_template_hash="{{args.canary-hash}}"}[2m])
+              )
+            )
+
+    # 2) Request queue building up = canary is slower than the traffic it receives
+    - name: queue-depth
+      interval: 1m
+      failureLimit: 3
+      successCondition: len(result) == 0 || isNaN(result[0]) || result[0] < 8
+      provider:
+        prometheus:
+          address: http://kube-prometheus-stack-prometheus.monitoring.svc:9090
+          query: >-
+            max(vllm:num_requests_waiting{namespace="inference",rollouts_pod_template_hash="{{args.canary-hash}}"})
+
+    # 3) KV-cache saturation (new model/config using far more cache than stable)
+    - name: kv-cache-usage
+      interval: 1m
+      failureLimit: 3
+      successCondition: len(result) == 0 || isNaN(result[0]) || result[0] < 0.95
+      provider:
+        prometheus:
+          address: http://kube-prometheus-stack-prometheus.monitoring.svc:9090
+          query: >-
+            max(vllm:gpu_cache_usage_perc{namespace="inference",rollouts_pod_template_hash="{{args.canary-hash}}"})
+
+    # 4) Crash loops / OOM kills on canary pods (any restart in 5 min fails the gate)
+    - name: container-restarts
+      interval: 1m
+      failureLimit: 0
+      successCondition: len(result) == 0 || isNaN(result[0]) || result[0] < 1
+      provider:
+        prometheus:
+          address: http://kube-prometheus-stack-prometheus.monitoring.svc:9090
+          query: >-
+            sum(increase(kube_pod_container_status_restarts_total{namespace="inference",pod=~"vllm-llama-{{args.canary-hash}}-.*"}[5m]))

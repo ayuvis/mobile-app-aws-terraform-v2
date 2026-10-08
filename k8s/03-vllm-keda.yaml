@@ -1,0 +1,47 @@
+# KEDA autoscaling for vLLM. It scales the Rollout via the scale subresource.
+# GPU pods are slow to start (new node + weights + model load), so:
+#   - keep a warm minimum (never scale to zero on the request path)
+#   - scale UP immediately and in steps, scale DOWN slowly
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: vllm-llama
+  namespace: inference
+spec:
+  scaleTargetRef:
+    apiVersion: argoproj.io/v1alpha1
+    kind: Rollout
+    name: vllm-llama
+  minReplicaCount: 2
+  maxReplicaCount: 8            # must stay within the GPU NodePool limit (16 GPUs)
+  pollingInterval: 15
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - { type: Pods, value: 2, periodSeconds: 60 }
+        scaleDown:
+          stabilizationWindowSeconds: 600
+          policies:
+            - { type: Pods, value: 1, periodSeconds: 300 }
+  triggers:
+    # Waiting requests per replica. Scale out when each pod has > 4 queued.
+    - type: prometheus
+      name: queue-depth
+      metricType: AverageValue
+      metadata:
+        serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc:9090
+        query: 'sum(vllm:num_requests_waiting{namespace="inference"})'
+        threshold: "4"
+
+    # Average KV-cache utilisation across pods (already a per-pod average,
+    # so metricType is Value, not AverageValue). Scale out above 80%.
+    - type: prometheus
+      name: kv-cache
+      metricType: Value
+      metadata:
+        serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc:9090
+        query: 'avg(vllm:gpu_cache_usage_perc{namespace="inference"})'
+        threshold: "0.8"
