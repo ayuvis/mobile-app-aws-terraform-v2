@@ -18,6 +18,8 @@ module "eks" {
     kube-proxy             = {}
     vpc-cni                = { before_compute = true }
     eks-pod-identity-agent = { before_compute = true }
+    # Required for CPU/memory HPAs and `kubectl top`. KEDA alone does not provide it.
+    metrics-server = {}
   }
 
   # Small Graviton group that only runs system pods (Karpenter, CoreDNS).

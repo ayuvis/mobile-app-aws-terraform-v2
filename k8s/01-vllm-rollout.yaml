@@ -56,7 +56,10 @@ metadata:
   name: vllm-llama
   namespace: inference
 spec:
-  replicas: 2                    # KEDA owns the live replica count (see 03-vllm-keda.yaml)
+  # KEDA owns the live replica count (see 03-vllm-keda.yaml). Re-applying this file
+  # resets it to 2 until KEDA corrects it, so prefer `kubectl argo rollouts set image`
+  # or a patch for routine changes, or have Argo CD ignore /spec/replicas.
+  replicas: 2
   revisionHistoryLimit: 3
   progressDeadlineSeconds: 1500  # new GPU node (~3-5 min) + weight download + model load
   selector:
@@ -95,6 +98,9 @@ spec:
         - name: fetch-weights   # pulls weights from S3, never from Hugging Face at start
           image: amazon/aws-cli:2.17.0
           command: ["aws", "s3", "sync", "s3://<MODELS_BUCKET>/llama-3.1-8b-instruct-awq/", "/models/llama"]
+          resources:
+            requests: { cpu: "1", memory: 1Gi }
+            limits:   { memory: 2Gi }
           volumeMounts:
             - { name: models, mountPath: /models }
       containers:
@@ -109,12 +115,16 @@ spec:
             - --enable-prefix-caching
           ports:
             - { name: http, containerPort: 8000 }
+          # Sized for a g5/g6 2xlarge (8 vCPU / 32 GiB, ~29 GiB allocatable). Without
+          # memory requests/limits the pod is BestEffort: first to be evicted and easy to OOM.
+          # Scale these up for bigger models or 4xlarge nodes.
           resources:
-            limits: { nvidia.com/gpu: 1 }
-          startupProbe:           # model load can take minutes
+            requests: { cpu: "4", memory: 20Gi, nvidia.com/gpu: 1 }
+            limits:   { memory: 26Gi, nvidia.com/gpu: 1 }
+          startupProbe:           # model load can take minutes; 120 x 10s = 20 min before restart
             httpGet: { path: /health, port: http }
             periodSeconds: 10
-            failureThreshold: 60
+            failureThreshold: 120
           readinessProbe:
             httpGet: { path: /health, port: http }
             periodSeconds: 10
@@ -128,4 +138,5 @@ spec:
         - name: models
           emptyDir: {}
         - name: shm
-          emptyDir: { medium: Memory, sizeLimit: 8Gi }
+          # Memory-backed volumes count toward the container memory limit, so keep this small
+          emptyDir: { medium: Memory, sizeLimit: 2Gi }

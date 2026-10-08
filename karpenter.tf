@@ -90,7 +90,10 @@ resource "kubectl_manifest" "nodepool_general" {
         cpu: "2000"
       disruption:
         consolidationPolicy: WhenEmptyOrUnderutilized
-        consolidateAfter: 1m
+        # 1m caused constant node churn and pod rescheduling; be patient in prod
+        consolidateAfter: 10m
+        budgets:
+          - nodes: "10%"   # never disrupt more than 10% of general nodes at once
   YAML
 
   depends_on = [kubectl_manifest.nodeclass_default]
@@ -141,12 +144,17 @@ resource "kubectl_manifest" "nodepool_gpu" {
             - { key: kubernetes.io/arch, operator: In, values: ["amd64"] }
             - { key: karpenter.sh/capacity-type, operator: In, values: ["on-demand"] }
             - { key: karpenter.k8s.aws/instance-family, operator: In, values: ["g5", "g6"] }
+            # xlarge nodes only have 16 GiB host RAM, which OOM-kills vLLM during model load.
+            # 2xlarge = 8 vCPU / 32 GiB, 4xlarge = 16 vCPU / 64 GiB (same single GPU).
+            - { key: karpenter.k8s.aws/instance-size, operator: In, values: ["2xlarge", "4xlarge"] }
       limits:
         nvidia.com/gpu: "16"
       disruption:
         # Weights take minutes to load: be slow to scale GPU nodes down
         consolidationPolicy: WhenEmpty
         consolidateAfter: 15m
+        budgets:
+          - nodes: "1"     # replace/disrupt at most one GPU node at a time
   YAML
 
   depends_on = [kubectl_manifest.nodeclass_gpu]

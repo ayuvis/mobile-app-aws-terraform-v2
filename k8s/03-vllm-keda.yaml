@@ -1,7 +1,9 @@
 # KEDA autoscaling for vLLM. It scales the Rollout via the scale subresource.
 # GPU pods are slow to start (new node + weights + model load), so:
 #   - keep a warm minimum (never scale to zero on the request path)
-#   - scale UP immediately and in steps, scale DOWN slowly
+#   - scale UP gradually: pending pods don't lower the metric, so a fast scale-up
+#     overshoots to max and then thrashes on the way down
+#   - scale DOWN slowly
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
@@ -15,13 +17,18 @@ spec:
   minReplicaCount: 2
   maxReplicaCount: 8            # must stay within the GPU NodePool limit (16 GPUs)
   pollingInterval: 15
+  # If Prometheus is unreachable (3 failed polls), hold 2 replicas instead of
+  # leaving the HPA with no metrics. Requires AverageValue triggers (see below).
+  fallback:
+    failureThreshold: 3
+    replicas: 2
   advanced:
     horizontalPodAutoscalerConfig:
       behavior:
         scaleUp:
-          stabilizationWindowSeconds: 0
+          stabilizationWindowSeconds: 120   # demand must persist for 2 min
           policies:
-            - { type: Pods, value: 2, periodSeconds: 60 }
+            - { type: Pods, value: 1, periodSeconds: 300 }   # one new GPU pod per 5 min
         scaleDown:
           stabilizationWindowSeconds: 600
           policies:
@@ -36,12 +43,21 @@ spec:
         query: 'sum(vllm:num_requests_waiting{namespace="inference"})'
         threshold: "4"
 
-    # Average KV-cache utilisation across pods (already a per-pod average,
-    # so metricType is Value, not AverageValue). Scale out above 80%.
+    # KV-cache utilisation. Using sum() with AverageValue is equivalent to targeting an
+    # 80% average across pods, and (unlike metricType Value) it works with `fallback`.
     - type: prometheus
       name: kv-cache
-      metricType: Value
+      metricType: AverageValue
       metadata:
         serverAddress: http://kube-prometheus-stack-prometheus.monitoring.svc:9090
-        query: 'avg(vllm:gpu_cache_usage_perc{namespace="inference"})'
+        query: 'sum(vllm:gpu_cache_usage_perc{namespace="inference"})'
         threshold: "0.8"
+
+    # OPTIONAL: lower the floor outside business hours. To use it, set minReplicaCount: 1
+    # above and uncomment. During the window below, KEDA keeps at least 2 replicas.
+    # - type: cron
+    #   metadata:
+    #     timezone: Asia/Kolkata
+    #     start: "0 9 * * *"
+    #     end: "0 22 * * *"
+    #     desiredReplicas: "2"
